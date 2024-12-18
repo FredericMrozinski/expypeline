@@ -1,17 +1,60 @@
 import json
+import os
+import socket
+import copy
 import traceback
+import base64
 from datetime import datetime
 from typing import Optional, Callable, List
 
+version = "0.2.0"
+
+def path_safe(path: str):
+    path = path.replace("\\", "/")
+    if path.endswith("/"):
+        return path[:-1]
+    return path
+
+def folder_safe(folder: str):
+    return path_safe(folder) # TODO implement
+
 class ExpSuite:
-    pass
+    def __init__(self, output_directory: Optional[str] = None):
+        self.output_directory: Optional[str] = path_safe(output_directory) if output_directory else None
+        self.experiments: List['Experiment'] = []
+        self.current_experiment = None
+
+    def queue_experiment(self, experiment_name: str, experiment_pipeline: 'ExpPipelineLevelList | ExpStep'):
+        self.experiments.append(Experiment(experiment_name, experiment_pipeline, self))
+
+    def get_shared_data_directory(self):
+        return self.output_directory + "/shared"
+
+    def get_experiment_specific_directory(self, experiment: 'Experiment'):
+        return self.output_directory + "/" + folder_safe(experiment.experiment_name)
+
+    def run(self):
+        print("  ______      _____                  _ _\n"            
+" |  ____|    |  __ \\                | (_)\n"           
+" | |__  __  _| |__) |   _ _ __   ___| |_ _ __   ___\n" 
+" |  __| \\ \\/ /  ___/ | | | '_ \\ / _ \\ | | '_ \\ / _ \\\n"
+" | |____ >  <| |   | |_| | |_) |  __/ | | | | |  __/\n"
+" |______/_/\\_\\_|    \\__, | .__/ \\___|_|_|_| |_|\\___|\n"
+"                     __/ | |                        \n"
+"                    |___/|_|                  v" + str(version) + "\n\n")
+
+        print("QUEUED EXPERIMENTS:")
+        for experiment in self.experiments:
+            print(f"   - {experiment.experiment_name}")
+
+        for experiment in self.experiments:
+            experiment.run()
 
 class ExpState:
-    def __init__(self, step_tag: str, prev_state: Optional['ExpState'] = None):
-        # TODO remove step tag, not needed no more
-        self._step_tag = step_tag
+    def __init__(self, prev_state: Optional['ExpState'] = None):
         self._prev_state = prev_state
         self._attributes = {}
+        self.step_tag: str = None
 
     def __getitem__(self, key):
         if key in self._attributes:
@@ -35,50 +78,78 @@ class ExpState:
         else:
             return False
 
-    def derive_level_down(self, next_step_tag: str):
-        chained = ExpState(step_tag=next_step_tag, prev_state=self)
+    def derive_level_down(self):
+        chained = ExpState(prev_state=self)
         return chained
 
     def to_json_dict(self) -> dict:
         return self._attributes
 
-class ExpPipeline:
-    def __init__(self, exp_step: 'ExpStep', parent: 'ExpPipeline'):
-        self._parent = parent
-        self.exp_step = exp_step
+
+class ExpStepRunnable:
+    def __init__(self, tag: str, step: Callable[[ExpState], None]):
+        self._step = step
+        self.logs = {}
+        self.tag = tag
         self.last_state = None
-        self.next_pipelines = []
 
-    def run(self, state: ExpState | None, parent_experiment: 'Experiment'):
-        # Implement exception handling such that the pipeline still runs other steps
-        # Implement seed resetting for every step -> also log seed to state
-
+    def run(self, state: ExpState, prev_step_tags: List[str], pruned: bool = False):
         self.last_state = state
 
-        pipeline_tag = (" " + parent_experiment.experiment_name + " => "
-                        + self.get_preceding_step_tags() + " > " + self.exp_step.tag + " ")
+        state.step_tag = self.tag
+        context_step_tag = " > ".join([*prev_step_tags, self.tag])
 
-        print("\n\n----" + pipeline_tag + "-" * (98 - len(pipeline_tag)))
+        if pruned:
+            self.logs["status"] = "pruned"
+            print("×× PRUNED ×× -- " + context_step_tag + " " + "-" * (85 - len(context_step_tag)))
+            return False
+
+        print("\n\n-- " + context_step_tag + " " + "-" * (98 - len(context_step_tag)))
+
+        self.logs["begin"] = datetime.now()
 
         try:
-            self.exp_step.run(state)
+            self._step(state)
+            self.logs["status"] = "success"
         except Exception as e:
             print("\n×××× ! Exception thrown ! " + "×" * 76)
-            print("× Pruning the following steps:" + " " * 71 + "×")
-            for tag in self.get_subsequent_step_tags():
-                print("× " + tag + " " * max(0, 99 - len(tag)) + "×")
-            print("×" + " " * 100 + "×")
-            print("× What?:" + " " * 93 + "×")
-
-            for line in traceback.format_exc().splitlines():
+            stacktrace = traceback.format_exc()
+            for line in stacktrace.splitlines():
                 print("× " + line + " " * max(0, 98 - len(line)) + " ×")
-
             print("×" * 102 + "\n")
-        else:
-            for next_pipeline in self.next_pipelines:
-                next_pipeline.run(state.derive_level_down(next_pipeline.exp_step.tag), parent_experiment)
 
-    def run_order_str(self,
+            self.logs["status"] = "fail"
+            self.logs["status_details"] = (f"Exception thrown: {repr(e)}. "
+                                           f"Base64 encoded stacktrace: {base64.b64encode(stacktrace.encode("ascii")).decode("ascii")}")
+
+        self.logs["end"] = datetime.now()
+        if self.logs["status"] == "success":
+            return True
+        return False
+
+    def to_json_dict(self) -> dict:
+        return {
+            "_name_": self.tag,
+            "_meta_": self.logs,
+            "_state_": {**self.last_state.to_json_dict()},
+        }
+
+
+class ExpPipelineRunnable:
+    def __init__(self):
+        self.heads: List[ExpStepRunnable] = []
+        self.subsequents: List[ExpPipelineRunnable] = []
+
+    def append_subsequent(self, subsequent_pipeline: 'ExpPipelineRunnable'):
+        for subsequent in self.subsequents:
+            subsequent.append_subsequent(copy.deepcopy(subsequent_pipeline))
+        if len(self.subsequents) == 0:
+            self.subsequents.append(copy.deepcopy(subsequent_pipeline))
+
+    def get_order_str(self, line_prefix: str):
+        return self._get_order_str_rec("", [], 0, line_prefix=line_prefix)
+
+    def _get_order_str_rec(self,
                       run_order_str: str,
                       branch_levels: List[int],
                       current_level: int,
@@ -92,142 +163,174 @@ class ExpPipeline:
                     res += "  "
             return res + '|\n' + res
 
-        run_order_str += "\n" + level_prefix(branch_levels, current_level)
-        run_order_str += "+---" + self.exp_step.tag
-
-        for i in range(len(self.next_pipelines)):
+        for i in range(len(self.subsequents)):
+            run_order_str += "\n" + level_prefix(branch_levels, current_level)
+            run_order_str += "+---" + self.heads[i].tag
             branch_levels_cpy = branch_levels.copy()
-            if len(self.next_pipelines) > 1 and i < len(self.next_pipelines) - 1:
-                branch_levels_cpy.append(current_level + 1)
-            run_order_str = self.next_pipelines[i].run_order_str(run_order_str, branch_levels_cpy, current_level + 1,
-                                                                 line_prefix)
+            if len(self.heads) > 1 and i < len(self.heads) - 1:
+                branch_levels_cpy.append(current_level)
+            if self.subsequents[i] is not None:
+                run_order_str = self.subsequents[i]._get_order_str_rec(run_order_str, branch_levels_cpy,
+                                                                     current_level + 1,
+                                                                     line_prefix)
 
         return run_order_str
 
-    def set_next_steps(self, *steps):
-        for step in steps:
-            self.next_pipelines.append(ExpPipeline(step, parent=self))
+    def run(self, state: ExpState, prev_step_tags: List[str], pruned: bool = False):
+        for head, subsequent in zip(self.heads, self.subsequents):
+            current_state = state.derive_level_down()
+            successful = head.run(current_state, prev_step_tags.copy(), pruned=pruned)
+            if subsequent is not None:
+                subsequent.run(current_state, [*prev_step_tags, head.tag], pruned=not successful or pruned)
 
-    def get_subsequent_step_tags(self, concat_preceding: bool = True) -> List[str]:
-        if len(self.next_pipelines) == 0:
-            return [self.exp_step.tag]
-        else:
-            step_tags = []
-            own_tag = self.exp_step.tag
-            if concat_preceding:
-                own_tag = self.get_preceding_step_tags() + " > " + own_tag
-            step_tags.append(own_tag)
-
-            for next_pipeline in self.next_pipelines:
-                tmp_tags = next_pipeline.get_subsequent_step_tags(concat_preceding=False)
-                for i in range(len(tmp_tags)):
-                    tmp_tags[i] = own_tag + " > " + tmp_tags[i]
-
-                step_tags.extend(tmp_tags)
-            return step_tags
-
-    def get_preceding_step_tags(self) -> str:
-        if self._parent is None:
-            return ""
-        else:
-            parent_str = self._parent.get_preceding_step_tags()
-            if parent_str != "":
-                return parent_str + " > " + self._parent.exp_step.tag
+    def to_json_dict(self) -> dict:
+        json_dict = []
+        for head, subsequent in zip(self.heads, self.subsequents):
+            head_json_dict = head.to_json_dict()
+            if subsequent is None:
+                head_json_dict["_subsequent_"] = "None"
             else:
-                return self._parent.exp_step.tag
+                head_json_dict["_subsequent_"] = subsequent.to_json_dict()
+            json_dict.append(head_json_dict)
 
-    def state_to_json_dict(self) -> dict:
-        step_dict = {
-            "_step_" : self.exp_step.tag,
-            "_step_runtime_" : str(self.exp_step.timestamps["end"] - self.exp_step.timestamps["begin"]),
-            "_step_state_" : self.last_state.to_json_dict(),
-            "_subsequent_steps_" : [next_step.state_to_json_dict() for next_step in self.next_pipelines],
-        }
-        return step_dict
+        return json_dict
 
-class ExpPipelineLevelList:
-    def __init__(self, pipeline: Optional[ExpPipeline] = None):
-        if pipeline is not None:
-            self._pipelines_at_level = [pipeline]
-        else:
-            self._pipelines_at_level = []
-        self._root = None
+class ExpPipelineBuilder:
+    def __init__(self):
+        self.root = self
 
-    def run_order_str(self, line_prefix: Optional[str] = ""):
-        run_order_str = line_prefix + "EXPERIMENT PIPELINE:"
+    def then(self, subsequent: 'ExpPipelineBuilder'):
+        pass
 
-        root = self._root if self._root is not None else self
+    def branch(self, subsequent: 'ExpPipelineBuilder'):
+        pass
 
-        for pipeline in root._pipelines_at_level:
-            run_order_str = pipeline.run_order_str(run_order_str, [], 0, line_prefix)
+    def build(self) -> ExpPipelineRunnable:
+        pass
 
-        return run_order_str
+    def _build_rec(self) -> ExpPipelineRunnable:
+        pass
 
-    def then(self, *steps) -> 'ExpPipelineLevelList':
-        next_level_list = ExpPipelineLevelList()
+class ExpPipelineBuilderPiece(ExpPipelineBuilder):
+    def __init__(self, step: 'ExpStepRunnable'):
+        ExpPipelineBuilder.__init__(self)
+        self.heads: List['ExpStepRunnable'] = []
+        if step is not None:
+            self.heads.append(step)
+        self.subsequent: ExpPipelineBuilder = None
 
-        if self._root is None:
-            next_level_list._root = self
-        else:
-            next_level_list._root = self._root
+    def then(self, subsequent: 'ExpPipelineBuilder') -> ExpPipelineBuilder:
+        if subsequent is None:
+            raise PermissionError("Cannot call ExpPipeline.then(..) on a pipeline that already has a subsequent "
+                                  "pipeline. If you want to branch off multiple subsequent steps at the same level,"
+                                  "please call ExpPipeline.branch(..), instead.")
 
-        for pipeline in self._pipelines_at_level:
-            pipeline.set_next_steps(*steps)
-            next_level_list._pipelines_at_level.extend(pipeline.next_pipelines)
+        subsequent = ExpPipelineBuilderPiece(subsequent.root)
+        subsequent.root = self.root
+        subsequent.heads[0].root = self.root
+        self.subsequent = subsequent
+        return subsequent
 
-        return next_level_list
+    def branch(self, subsequent: 'ExpPipelineBuilder') -> ExpPipelineBuilder:
+        # Turn ExpStep into ExpPipelinePiece if necessary
+        if isinstance(subsequent, ExpStep):
+            subsequent = ExpPipelineBuilderPiece(subsequent)
 
-    def run(self, parent_experiment: 'Experiment'):
-        if self._root is None:
-            for pipeline in self._pipelines_at_level:
-                pipeline.run(parent_experiment.root_exp_state.derive_level_down(pipeline.exp_step.tag),
-                             parent_experiment)
-        else:
-            self._root.run(parent_experiment)
+        self.heads.append(subsequent.root)
+        subsequent.root = self.root
+        return self
 
-    def state_to_json_dict(self) -> dict:
-        if self._root is None:
-            step_dict = {
-                "_steps_" : [next_step.state_to_json_dict() for next_step in self._pipelines_at_level]
-            }
-            return step_dict
-        else:
-            return self._root.state_to_json_dict()
+    def build(self) -> ExpPipelineRunnable:
+        return self.root._build_rec()
 
-class ExpStep:
+    def _build_rec(self) -> ExpPipelineRunnable:
+        runnable = ExpPipelineRunnable()
+
+        for head in self.heads:
+            # If we have nested branches or nested straight pipelines, we want to unnest them
+            built_head = head._build_rec()
+            built_subsequent = self.subsequent._build_rec() if self.subsequent is not None else None
+            if isinstance(head, ExpPipelineBuilderPiece):
+                for i in range(len(built_head.heads)):
+                    nested_head = built_head.heads[i]
+                    runnable.heads.append(nested_head)
+                    nested_subsequent = built_head.subsequents[i] if len(built_head.subsequents) > 0 else None
+                    runnable.subsequents.append(nested_subsequent)
+                    if built_subsequent is not None:
+                        if runnable.subsequents[-1] is None:
+                            runnable.subsequents[-1] = copy.deepcopy(built_subsequent)
+                        else:
+                            runnable.subsequents[-1].append_subsequent(built_subsequent)
+            elif isinstance(head, ExpStep):
+                # ExpSteps are wrapped into an ExpPipelineRunnable when built. Here, we unwrap them because we don't
+                # want that wrapping in this case
+                runnable.heads.append(built_head.heads[0])
+                runnable.subsequents.append(built_subsequent)
+
+        return runnable
+
+
+class ExpStep(ExpPipelineBuilder):
     def __init__(self, tag: str, step: Callable[[ExpState], None]):
+        ExpPipelineBuilder.__init__(self)
         self._step = step
-        self.timestamps = {}
         self.tag = tag
 
-    def run(self, state: ExpState):
-        self.timestamps["begin"] = datetime.now()
-        self._step(state)
-        self.timestamps["end"] = datetime.now()
+    def then(self, subsequent: 'ExpPipelineBuilder') -> ExpPipelineBuilder:
+        res = ExpPipelineBuilderPiece(self)
+        res = res.then(subsequent)
+        return res
 
-    def then(self, *next_steps) -> ExpPipelineLevelList: # TODO type annotate param
-        pipeline_level_list = ExpPipelineLevelList(ExpPipeline(self, parent=None))
-        return pipeline_level_list.then(*next_steps)
+    def branch(self, subsequent: 'ExpPipelineBuilder') -> ExpPipelineBuilder:
+        res = ExpPipelineBuilderPiece(self)
+        res = res.branch(subsequent)
+        return res
+
+    def build(self) -> ExpPipelineRunnable:
+        return self._build_rec()
+
+    def _build_rec(self) -> ExpPipelineRunnable:
+        runnable = ExpPipelineRunnable()
+        step = ExpStepRunnable(self.tag, self._step)
+        runnable.heads.append(step)
+        return runnable
+
 
 class Experiment:
-    def __init__(self, experiment_name: str, experiment_pipeline: ExpPipelineLevelList | ExpStep):
+    def __init__(self,
+                 experiment_name: str,
+                 experiment_pipeline: ExpPipelineBuilder,
+                 experiment_suite: ExpSuite):
         self.experiment_name = experiment_name
-        if isinstance(experiment_pipeline, ExpStep):
-            experiment_pipeline = ExpPipelineLevelList(ExpPipeline(experiment_pipeline, None))
-        self.experiment_pipeline = experiment_pipeline
+        self.experiment_pipeline = experiment_pipeline.build()
         self.timestamps = {}
-        self.root_exp_state = ExpState(experiment_name, None)
+        self.root_exp_state = ExpState(None)
+        self.experiment_suite = experiment_suite
 
     def run(self):
-        print("== BEGINNING NEW EXPERIMENT " + "=" * 74)
+        print("\n\n== BEGINNING NEW EXPERIMENT " + "=" * 74)
         print("    NAME: " + self.experiment_name)
-        print(self.experiment_pipeline.run_order_str("    "))
+        print(self.experiment_pipeline.get_order_str("    "))
 
         self.timestamps["begin"] = datetime.now()
-        self.experiment_pipeline.run(self)
+        self.experiment_pipeline.run(self.root_exp_state, [self.experiment_name], pruned=False)
         self.timestamps["end"] = datetime.now()
 
-        print("== ENDING EXPERIMENT " + "=" * 81)
+        print("\n-- ENDING & SAVING EXPERIMENT " + "-" * 72)
+        state_str = self.get_exp_state_str()
+        if self.experiment_suite.output_directory is not None and os.path.isdir(self.experiment_suite.output_directory):
+            exp_out_path = self.experiment_suite.get_experiment_specific_directory(self)
+            exp_out_path += "/run_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            if not os.path.exists(exp_out_path):
+                os.mkdir(exp_out_path)
+
+            with open(exp_out_path + "/experiment_state.json", "w") as text_file:
+                text_file.write(state_str)
+
+        else:
+            print("! No valid output path specified in ExpSuite ! Not writing experiment state but dumping here: ")
+            print(state_str)
+        print("== ENDED EXPERIMENT " + "=" * 82)
 
     def get_exp_state_str(self) -> str:
         exp_dict = {
@@ -235,7 +338,9 @@ class Experiment:
             "_experiment_begin_" : self.timestamps["begin"].isoformat(sep=' ', timespec='milliseconds'),
             "_experiment_end_" : self.timestamps["end"].isoformat(sep=' ', timespec='milliseconds'),
             "_experiment_runtime_" : str(self.timestamps["end"] - self.timestamps["begin"]),
-            **self.experiment_pipeline.state_to_json_dict()
+            "_host_system_" : socket.gethostname(),
+            "_expy_version_" : version,
+            "_steps_": self.experiment_pipeline.to_json_dict(),
         }
         return json.dumps(exp_dict, indent=4, sort_keys=True, default=lambda o: str(o))
 
