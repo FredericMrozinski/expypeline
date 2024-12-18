@@ -12,3 +12,4 @@ A Python framework to modularize, log, and run scientific experiments.
 
 ## Missing features
 - [ ] Multi-threaded pipeline. Experiments are currently run sequentially.
+- [ ] Experiment chaining currently limited by Python's recursion depth. An iterative scheduler should be implemented at some point.
