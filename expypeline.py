@@ -1,13 +1,38 @@
+# MIT License
+#
+# Copyright (c) 2024 Frederic Mrozinski
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+
 import json
 import os
 import socket
 import copy
+import sys
 import traceback
 import base64
+import platform, re, uuid
 from datetime import datetime
 from typing import Optional, Callable, List
 
-version = "0.2.0"
+version = "0.2.1"
 
 def path_safe(path: str):
     path = path.replace("\\", "/")
@@ -287,12 +312,14 @@ class ExpStep(ExpPipelineBuilder):
         return res
 
     def build(self) -> ExpPipelineRunnable:
-        return self._build_rec()
+        built = self._build_rec()
+        return built
 
     def _build_rec(self) -> ExpPipelineRunnable:
         runnable = ExpPipelineRunnable()
         step = ExpStepRunnable(self.tag, self._step)
         runnable.heads.append(step)
+        runnable.subsequents.append(None)
         return runnable
 
 
@@ -338,9 +365,19 @@ class Experiment:
             "_experiment_begin_" : self.timestamps["begin"].isoformat(sep=' ', timespec='milliseconds'),
             "_experiment_end_" : self.timestamps["end"].isoformat(sep=' ', timespec='milliseconds'),
             "_experiment_runtime_" : str(self.timestamps["end"] - self.timestamps["begin"]),
-            "_host_system_" : socket.gethostname(),
+            "_system_" : {
+                'platform': platform.system(),
+                'platform-release': platform.release(),
+                'platform-version': platform.version(),
+                'architecture': platform.machine(),
+                'hostname': socket.gethostname(),
+                'ip-address': socket.gethostbyname(socket.gethostname()),
+                'mac-address': ':'.join(re.findall('..', '%012x' % uuid.getnode())),
+                'processor': platform.processor(),
+                'python_version': sys.version,
+            },
             "_expy_version_" : version,
-            "_steps_": self.experiment_pipeline.to_json_dict(),
+            "steps": self.experiment_pipeline.to_json_dict(),
         }
         return json.dumps(exp_dict, indent=4, sort_keys=True, default=lambda o: str(o))
 
