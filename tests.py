@@ -90,3 +90,32 @@ class ExPypelineTests(unittest.TestCase):
         suite.run()
 
         self.assertListEqual(step_tracker, [f"Step {i}" for i in range(depth)])
+
+
+    def test_simple_branching_pipeline(self):
+        suite = expy.ExpSuite(None)
+
+        step_tracker: List[str] = []
+
+        depth = 20
+
+        init_fun = functools.partial(general_exp_step, None,
+                                         "key",
+                                         None,
+                                         "a",
+                                         self)
+        pipeline = expy.ExpStep("Init step", init_fun)
+
+        for i in range(depth):
+            step_fun = functools.partial(general_exp_step, "key",
+                                         "key",
+                                         "a",
+                                         f"value {i}", step_tracker,
+                                         self)
+            step = expy.ExpStep(f"Step {i}", step_fun)
+            pipeline = pipeline.branch(step)
+
+        suite.queue_experiment("Simple branching experiment", pipeline)
+        suite.run()
+
+        self.assertListEqual(step_tracker, [f"Step {i}" for i in range(depth)])

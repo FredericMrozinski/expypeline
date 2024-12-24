@@ -26,13 +26,14 @@ import os
 import socket
 import copy
 import sys
+import shutil
 import traceback
 import base64
 import platform, re, uuid
 from datetime import datetime
 from typing import Optional, Callable, List
 
-version = "0.2.1"
+version = "0.2.2"
 
 def path_safe(path: str):
     path = path.replace("\\", "/")
@@ -46,19 +47,23 @@ def folder_safe(folder: str):
 class ExpSuite:
     def __init__(self, output_directory: Optional[str] = None):
         self.output_directory: Optional[str] = path_safe(output_directory) if output_directory else None
+        self.global_shared_directory =  self.output_directory + "/shared/data"
         self.experiments: List['Experiment'] = []
         self.current_experiment = None
+        self.reproducibility_handler: Optional[Callable[[float], None]] = None
+
+        def step_name_based_seed_generator(level: int, state: 'ExpState') -> float:
+            seed = 0
+            for c in state.step_tag:
+                seed += ord(c)
+            return seed
+        self.seed_generator: Callable[[int, 'ExpState'], float] = step_name_based_seed_generator
+
 
     def queue_experiment(self, experiment_name: str, experiment_pipeline: 'ExpPipelineLevelList | ExpStep'):
         self.experiments.append(Experiment(experiment_name, experiment_pipeline, self))
 
-    def get_shared_data_directory(self):
-        return self.output_directory + "/shared"
-
-    def get_experiment_specific_directory(self, experiment: 'Experiment'):
-        return self.output_directory + "/" + folder_safe(experiment.experiment_name)
-
-    def run(self):
+    def run(self, debug: bool = False):
         print("  ______      _____                  _ _\n"            
 " |  ____|    |  __ \\                | (_)\n"           
 " | |__  __  _| |__) |   _ _ __   ___| |_ _ __   ___\n" 
@@ -68,18 +73,34 @@ class ExpSuite:
 "                     __/ | |                        \n"
 "                    |___/|_|                  v" + str(version) + "\n\n")
 
+        # Warn if no seed setter is passed TODO: make logger warning
+        if self.reproducibility_handler is None:
+            print("WARNING: No reproducibility handler has been set. Randomness will not be reproducible!")
+
         print("QUEUED EXPERIMENTS:")
         for experiment in self.experiments:
             print(f"   - {experiment.experiment_name}")
 
         for experiment in self.experiments:
-            experiment.run()
+            root_exp_state = ExpState(None)
+            root_exp_state._global_shared_data_dir = self.global_shared_directory
+            root_exp_state._debug_mode = debug
+            experiment.run(root_exp_state)
+
+    def set_reproducibility_handler(self, reproducibility_handler:
+            Optional[Callable[[float], None]]):
+        self.reproducibility_handler = reproducibility_handler
 
 class ExpState:
     def __init__(self, prev_state: Optional['ExpState'] = None):
         self._prev_state = prev_state
         self._attributes = {}
         self.step_tag: str = None
+        self._global_shared_data_dir = None
+        self._run_shared_data_dir = None
+        self._run_specific_data_dir = None
+        self._experiment_suite: ExpSuite = None
+        self._debug_mode = False
 
     def __getitem__(self, key):
         if key in self._attributes:
@@ -105,10 +126,29 @@ class ExpState:
 
     def derive_level_down(self):
         chained = ExpState(prev_state=self)
+        chained._global_shared_data_dir = self._global_shared_data_dir
+        chained._run_shared_data_dir = self._run_shared_data_dir
+        chained._run_specific_data_dir = self._run_specific_data_dir
+        chained._experiment_suite = self._experiment_suite
         return chained
 
     def to_json_dict(self) -> dict:
         return self._attributes
+
+    def get_global_shared_data_dir(self):
+        return self._global_shared_data_dir
+
+    def get_run_shared_data_dir(self):
+        return self._run_shared_data_dir
+
+    def get_run_specific_data_dir(self):
+        return self._run_specific_data_dir
+
+    def get_exp_suite(self):
+        return self._experiment_suite
+
+    def is_debug_mode(self):
+        return self._debug_mode
 
 
 class ExpStepRunnable:
@@ -118,24 +158,35 @@ class ExpStepRunnable:
         self.tag = tag
         self.last_state = None
 
-    def run(self, state: ExpState, prev_step_tags: List[str], pruned: bool = False):
+    def run(self, state: ExpState, prev_step_tags: List[str], run_status: dict, pruned: bool = False):
         self.last_state = state
+
+        run_status["total"] += 1
 
         state.step_tag = self.tag
         context_step_tag = " > ".join([*prev_step_tags, self.tag])
 
         if pruned:
             self.logs["status"] = "pruned"
+            run_status["pruned"] += 1
             print("×× PRUNED ×× -- " + context_step_tag + " " + "-" * (85 - len(context_step_tag)))
             return False
 
         print("\n\n-- " + context_step_tag + " " + "-" * (98 - len(context_step_tag)))
+
+        # (Re-)set seed
+        seed = "undefined (no reproducibility handler set)"
+        if state.get_exp_suite().reproducibility_handler is not None:
+            seed = state.get_exp_suite().seed_generator(0, state)
+            state.get_exp_suite().reproducibility_handler(seed)
+        self.logs["random_seed"] = seed
 
         self.logs["begin"] = datetime.now()
 
         try:
             self._step(state)
             self.logs["status"] = "success"
+            run_status["success"] += 1
         except Exception as e:
             print("\n×××× ! Exception thrown ! " + "×" * 76)
             stacktrace = traceback.format_exc()
@@ -146,6 +197,7 @@ class ExpStepRunnable:
             self.logs["status"] = "fail"
             self.logs["status_details"] = (f"Exception thrown: {repr(e)}. "
                                            f"Base64 encoded stacktrace: {base64.b64encode(stacktrace.encode("ascii")).decode("ascii")}")
+            run_status["error"] += 1
 
         self.logs["end"] = datetime.now()
         if self.logs["status"] == "success":
@@ -172,7 +224,7 @@ class ExpPipelineRunnable:
             self.subsequents.append(copy.deepcopy(subsequent_pipeline))
 
     def get_order_str(self, line_prefix: str):
-        return self._get_order_str_rec("", [], 0, line_prefix=line_prefix)
+        return f"{line_prefix}PIPELINE:\n" + self._get_order_str_rec("", [], 0, line_prefix="  " + line_prefix)
 
     def _get_order_str_rec(self,
                       run_order_str: str,
@@ -189,7 +241,7 @@ class ExpPipelineRunnable:
             return res + '|\n' + res
 
         for i in range(len(self.subsequents)):
-            run_order_str += "\n" + level_prefix(branch_levels, current_level)
+            run_order_str += ("\n" if current_level > 0 else "") + level_prefix(branch_levels, current_level)
             run_order_str += "+---" + self.heads[i].tag
             branch_levels_cpy = branch_levels.copy()
             if len(self.heads) > 1 and i < len(self.heads) - 1:
@@ -201,12 +253,12 @@ class ExpPipelineRunnable:
 
         return run_order_str
 
-    def run(self, state: ExpState, prev_step_tags: List[str], pruned: bool = False):
+    def run(self, state: ExpState, prev_step_tags: List[str], run_status: dict, pruned: bool = False):
         for head, subsequent in zip(self.heads, self.subsequents):
             current_state = state.derive_level_down()
-            successful = head.run(current_state, prev_step_tags.copy(), pruned=pruned)
+            successful = head.run(current_state, prev_step_tags.copy(), run_status, pruned=pruned)
             if subsequent is not None:
-                subsequent.run(current_state, [*prev_step_tags, head.tag], pruned=not successful or pruned)
+                subsequent.run(current_state, [*prev_step_tags, head.tag], run_status, pruned=not successful or pruned)
 
     def to_json_dict(self) -> dict:
         json_dict = []
@@ -331,33 +383,61 @@ class Experiment:
         self.experiment_name = experiment_name
         self.experiment_pipeline = experiment_pipeline.build()
         self.timestamps = {}
-        self.root_exp_state = ExpState(None)
         self.experiment_suite = experiment_suite
+        self.last_root_exp_state = None
 
-    def run(self):
+    def run(self, root_exp_state: ExpState):
+        self.last_root_exp_state = root_exp_state
+
         print("\n\n== BEGINNING NEW EXPERIMENT " + "=" * 74)
         print("    NAME: " + self.experiment_name)
         print(self.experiment_pipeline.get_order_str("    "))
 
+        run_state_dict = {
+            "total": 0,
+            "success": 0,
+            "pruned": 0,
+            "error": 0,
+        }
+
+        if self.experiment_suite.output_directory is not None:
+            exp_out_path = self.experiment_suite.output_directory + "/" + path_safe(self.experiment_name)
+            root_exp_state._run_shared_data_dir = exp_out_path + "/shared/data"
+            if root_exp_state.is_debug_mode():
+                exp_out_path += "/debug"
+                if os.path.exists(exp_out_path):
+                    shutil.rmtree(exp_out_path)
+            else:
+                exp_out_path += "/run_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            root_exp_state._run_specific_data_dir = exp_out_path + "/data"
+
+            if not os.path.exists(root_exp_state.get_global_shared_data_dir()):
+                os.makedirs(root_exp_state.get_global_shared_data_dir())
+            if not os.path.exists(exp_out_path):
+                os.makedirs(exp_out_path)
+            if not os.path.exists(root_exp_state.get_run_shared_data_dir()):
+                os.makedirs(root_exp_state.get_run_shared_data_dir())
+            if not os.path.exists(root_exp_state.get_run_specific_data_dir()):
+                os.makedirs(root_exp_state.get_run_specific_data_dir())
+
+        root_exp_state._experiment_suite = self.experiment_suite
+
         self.timestamps["begin"] = datetime.now()
-        self.experiment_pipeline.run(self.root_exp_state, [self.experiment_name], pruned=False)
+        self.experiment_pipeline.run(root_exp_state, [self.experiment_name], run_state_dict, pruned=False)
         self.timestamps["end"] = datetime.now()
 
         print("\n-- ENDING & SAVING EXPERIMENT " + "-" * 72)
         state_str = self.get_exp_state_str()
         if self.experiment_suite.output_directory is not None and os.path.isdir(self.experiment_suite.output_directory):
-            exp_out_path = self.experiment_suite.get_experiment_specific_directory(self)
-            exp_out_path += "/run_" + datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            if not os.path.exists(exp_out_path):
-                os.mkdir(exp_out_path)
-
             with open(exp_out_path + "/experiment_state.json", "w") as text_file:
                 text_file.write(state_str)
 
         else:
             print("! No valid output path specified in ExpSuite ! Not writing experiment state but dumping here: ")
             print(state_str)
-        print("== ENDED EXPERIMENT " + "=" * 82)
+
+        run_state_str = f"({run_state_dict['success']}/{run_state_dict['total']} steps successful)"
+        print(f"== ENDED EXPERIMENT === {run_state_str} " + "=" * (78 - len(run_state_str)))
 
     def get_exp_state_str(self) -> str:
         exp_dict = {
@@ -365,6 +445,7 @@ class Experiment:
             "_experiment_begin_" : self.timestamps["begin"].isoformat(sep=' ', timespec='milliseconds'),
             "_experiment_end_" : self.timestamps["end"].isoformat(sep=' ', timespec='milliseconds'),
             "_experiment_runtime_" : str(self.timestamps["end"] - self.timestamps["begin"]),
+            "_debug_mode_" : self.last_root_exp_state.is_debug_mode(),
             "_system_" : {
                 'platform': platform.system(),
                 'platform-release': platform.release(),
