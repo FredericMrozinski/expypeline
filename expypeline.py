@@ -27,14 +27,21 @@ import socket
 import copy
 import sys
 import shutil
+import time
 import traceback
+import logging
 import base64
 import platform, re, uuid
+import hashlib
 from datetime import datetime
 from typing import Optional, Callable, List
 
-version = "0.2.2"
+logger = logging.getLogger("ExPypeline")
+EXPYPELINE_LOG_LEVEL = 21
 
+version = "0.4.0"
+
+# TODO replace by os functionality
 def path_safe(path: str):
     path = path.replace("\\", "/")
     if path.endswith("/"):
@@ -44,13 +51,59 @@ def path_safe(path: str):
 def folder_safe(folder: str):
     return path_safe(folder) # TODO implement
 
+def _get_terminal_width():
+    try:
+        width = os.get_terminal_size()[0]
+    except OSError:
+        width = 80
+    return width
+
+class LogDecorationFilter(logging.Filter):
+    def filter(self, record):
+        # Add a level-based prefix (lowercase level name)
+        if record.levelno != 21:
+            record.msg = f"[{record.levelname}]{max(0, 8 - len(record.levelname)) * " "}{record.msg}"
+        return True
+
+class LogExportDecorationFilter(logging.Filter):
+    def filter(self, record):
+        to_return = ""
+        while record.msg[0] == '\n':
+            to_return += '\n'
+            record.msg = record.msg[1:]
+        record.msg = record.msg.replace('\n', '\n' + " " * 25)
+        to_return += f"[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}]    {record.msg}"
+        record.msg = to_return
+        return True
+
+def _set_log_export_location(file_name):
+    file_handler = logging.FileHandler(file_name)
+    file_handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(message)s')
+    file_handler.addFilter(LogExportDecorationFilter())
+    file_handler.setFormatter(formatter)
+    logging.getLogger().addHandler(file_handler)
+    return file_handler
+
+def _remove_log_export_handler(file_handler):
+    file_handler.close()
+    logging.getLogger().removeHandler(file_handler)
+
 class ExpSuite:
     def __init__(self, output_directory: Optional[str] = None):
         self.output_directory: Optional[str] = path_safe(output_directory) if output_directory else None
-        self.global_shared_directory =  self.output_directory + "/shared/data"
+        self.global_shared_directory =  os.path.join(self.output_directory, "shared/data")
         self.experiments: List['Experiment'] = []
         self.current_experiment = None
         self.reproducibility_handler: Optional[Callable[[float], None]] = None
+        self.log_level_counter = LogLevelCounter()
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        logging.getLogger().addHandler(self.log_level_counter)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setLevel(logging.DEBUG)
+        prefix_filter = LogDecorationFilter()
+        stream_handler.addFilter(prefix_filter)
+        logger.addFilter(stream_handler)
 
         def step_name_based_seed_generator(level: int, state: 'ExpState') -> float:
             seed = 0
@@ -64,7 +117,7 @@ class ExpSuite:
         self.experiments.append(Experiment(experiment_name, experiment_pipeline, self))
 
     def run(self, debug: bool = False):
-        print("  ______      _____                  _ _\n"            
+        logger.log(EXPYPELINE_LOG_LEVEL, "  ______      _____                  _ _\n"            
 " |  ____|    |  __ \\                | (_)\n"           
 " | |__  __  _| |__) |   _ _ __   ___| |_ _ __   ___\n" 
 " |  __| \\ \\/ /  ___/ | | | '_ \\ / _ \\ | | '_ \\ / _ \\\n"
@@ -75,17 +128,23 @@ class ExpSuite:
 
         # Warn if no seed setter is passed TODO: make logger warning
         if self.reproducibility_handler is None:
-            print("WARNING: No reproducibility handler has been set. Randomness will not be reproducible!")
+            logger.warning("No reproducibility handler has been set. Randomness will not be reproducible!")
 
-        print("QUEUED EXPERIMENTS:")
+        logger.log(EXPYPELINE_LOG_LEVEL, "QUEUED EXPERIMENTS:")
         for experiment in self.experiments:
-            print(f"   - {experiment.experiment_name}")
+            logger.log(EXPYPELINE_LOG_LEVEL, f"   - {experiment.experiment_name}")
 
+        log_export_handler = None
         for experiment in self.experiments:
+            if log_export_handler:
+                _remove_log_export_handler(log_export_handler)
+
             root_exp_state = ExpState(None)
             root_exp_state._global_shared_data_dir = self.global_shared_directory
             root_exp_state._debug_mode = debug
             experiment.run(root_exp_state)
+
+            log_export_handler = experiment.log_export_handler
 
     def set_reproducibility_handler(self, reproducibility_handler:
             Optional[Callable[[float], None]]):
@@ -96,11 +155,13 @@ class ExpState:
         self._prev_state = prev_state
         self._attributes = {}
         self.step_tag: str = None
+        self.unique_step_id: str = None
         self._global_shared_data_dir = None
         self._run_shared_data_dir = None
         self._run_specific_data_dir = None
         self._experiment_suite: ExpSuite = None
         self._debug_mode = False
+        self._logger = None
 
     def __getitem__(self, key):
         if key in self._attributes:
@@ -116,6 +177,8 @@ class ExpState:
                   f"a step-local copy of the attribute.") # TODO Replace by logger warning
         self._attributes[key] = value
 
+    # TODO add/override __contains__
+
     def has_key(self, key):
         if key in self._attributes:
             return True
@@ -124,16 +187,16 @@ class ExpState:
         else:
             return False
 
-    def derive_level_down(self):
+    def _to_json_dict(self) -> dict:
+        return self._attributes
+
+    def _derive_level_down(self):
         chained = ExpState(prev_state=self)
         chained._global_shared_data_dir = self._global_shared_data_dir
         chained._run_shared_data_dir = self._run_shared_data_dir
         chained._run_specific_data_dir = self._run_specific_data_dir
         chained._experiment_suite = self._experiment_suite
         return chained
-
-    def to_json_dict(self) -> dict:
-        return self._attributes
 
     def get_global_shared_data_dir(self):
         return self._global_shared_data_dir
@@ -150,6 +213,34 @@ class ExpState:
     def is_debug_mode(self):
         return self._debug_mode
 
+    def logger(self):
+        if self._logger is None:
+            self._logger = logging.getLogger(self.unique_step_id)
+            self._logger.setLevel(logging.DEBUG)
+
+            stream_handler = logging.StreamHandler()
+            stream_handler.setLevel(logging.DEBUG)
+            prefix_filter = LogDecorationFilter()
+            stream_handler.addFilter(prefix_filter)
+            self._logger.addFilter(stream_handler)
+
+        return self._logger
+
+    def debug(self, msg: str):
+        self.logger().debug(msg)
+
+    def info(self, msg: str):
+        self.logger().info(msg)
+
+    def warning(self, msg: str):
+        self.logger().warning(msg)
+
+    def error(self, msg: str):
+        self.logger().error(msg)
+
+    def fatal(self, msg: str):
+        self.logger().fatal(msg)
+
 
 class ExpStepRunnable:
     def __init__(self, tag: str, step: Callable[[ExpState], None]):
@@ -164,15 +255,20 @@ class ExpStepRunnable:
         run_status["total"] += 1
 
         state.step_tag = self.tag
-        context_step_tag = " > ".join([*prev_step_tags, self.tag])
+        # Make runtime dependent step-id
+        id_base = self.tag + str(time.time_ns())
+        unique_step_id = hashlib.md5(id_base.encode('utf-8')).hexdigest()[:12]
+        self.logs["unique_step_id"] = unique_step_id
+        state.unique_step_id = unique_step_id
+        context_step_tag = " 🠞 ".join([*prev_step_tags, self.tag])
 
         if pruned:
             self.logs["status"] = "pruned"
             run_status["pruned"] += 1
-            print("×× PRUNED ×× -- " + context_step_tag + " " + "-" * (85 - len(context_step_tag)))
+            logger.warning("×× PRUNED ×× -- " + context_step_tag + " " + "-" * (85 - len(context_step_tag)))
             return False
 
-        print("\n\n-- " + context_step_tag + " " + "-" * (98 - len(context_step_tag)))
+        logger.log(EXPYPELINE_LOG_LEVEL, "\n── " + context_step_tag + " " + "─" * (_get_terminal_width() - len(context_step_tag) - 6))
 
         # (Re-)set seed
         seed = "undefined (no reproducibility handler set)"
@@ -187,16 +283,19 @@ class ExpStepRunnable:
             self._step(state)
             self.logs["status"] = "success"
             run_status["success"] += 1
-        except Exception as e:
-            print("\n×××× ! Exception thrown ! " + "×" * 76)
+        except (Exception, KeyboardInterrupt) as e:
+            logger.log(EXPYPELINE_LOG_LEVEL, "")
+            logger.error("")
+            logger.log(EXPYPELINE_LOG_LEVEL, "×××× ! Exception thrown ! " + "×" * 76)
             stacktrace = traceback.format_exc()
             for line in stacktrace.splitlines():
-                print("× " + line + " " * max(0, 98 - len(line)) + " ×")
-            print("×" * 102 + "\n")
+                logger.log(EXPYPELINE_LOG_LEVEL, line)
+            logger.log(EXPYPELINE_LOG_LEVEL, "×" * 102 + "\n")
 
             self.logs["status"] = "fail"
             self.logs["status_details"] = (f"Exception thrown: {repr(e)}. "
-                                           f"Base64 encoded stacktrace: {base64.b64encode(stacktrace.encode("ascii")).decode("ascii")}")
+                                           f"Base64 encoded stacktrace: "
+                                           f"{base64.b64encode(stacktrace.encode('ascii')).decode('ascii')}")
             run_status["error"] += 1
 
         self.logs["end"] = datetime.now()
@@ -208,7 +307,7 @@ class ExpStepRunnable:
         return {
             "_name_": self.tag,
             "_meta_": self.logs,
-            "_state_": {**self.last_state.to_json_dict()},
+            "_state_": {**self.last_state._to_json_dict()},
         }
 
 
@@ -224,7 +323,7 @@ class ExpPipelineRunnable:
             self.subsequents.append(copy.deepcopy(subsequent_pipeline))
 
     def get_order_str(self, line_prefix: str):
-        return f"{line_prefix}PIPELINE:\n" + self._get_order_str_rec("", [], 0, line_prefix="  " + line_prefix)
+        return f"{line_prefix}PIPELINE:\n" + self._get_order_str_rec("", [], 0, line_prefix=line_prefix)
 
     def _get_order_str_rec(self,
                       run_order_str: str,
@@ -235,14 +334,15 @@ class ExpPipelineRunnable:
             res = line_prefix
             for l in range(current_level):
                 if l in branch_levels:
-                    res += "| "
+                    res += "│   "
                 else:
-                    res += "  "
-            return res + '|\n' + res
+                    res += "    "
+            return res #+ '│\n'
 
         for i in range(len(self.subsequents)):
-            run_order_str += ("\n" if current_level > 0 else "") + level_prefix(branch_levels, current_level)
-            run_order_str += "+---" + self.heads[i].tag
+            run_order_str += level_prefix(branch_levels, current_level)
+            branch_prefix = "├─🠞 " if i < len(self.subsequents) - 1 else "└─🠞 "
+            run_order_str += branch_prefix + self.heads[i].tag + "\n"
             branch_levels_cpy = branch_levels.copy()
             if len(self.heads) > 1 and i < len(self.heads) - 1:
                 branch_levels_cpy.append(current_level)
@@ -255,7 +355,7 @@ class ExpPipelineRunnable:
 
     def run(self, state: ExpState, prev_step_tags: List[str], run_status: dict, pruned: bool = False):
         for head, subsequent in zip(self.heads, self.subsequents):
-            current_state = state.derive_level_down()
+            current_state = state._derive_level_down()
             successful = head.run(current_state, prev_step_tags.copy(), run_status, pruned=pruned)
             if subsequent is not None:
                 subsequent.run(current_state, [*prev_step_tags, head.tag], run_status, pruned=not successful or pruned)
@@ -265,7 +365,7 @@ class ExpPipelineRunnable:
         for head, subsequent in zip(self.heads, self.subsequents):
             head_json_dict = head.to_json_dict()
             if subsequent is None:
-                head_json_dict["_subsequent_"] = "None"
+                head_json_dict["_subsequent_"] = []
             else:
                 head_json_dict["_subsequent_"] = subsequent.to_json_dict()
             json_dict.append(head_json_dict)
@@ -309,6 +409,9 @@ class ExpPipelineBuilderPiece(ExpPipelineBuilder):
         return subsequent
 
     def branch(self, subsequent: 'ExpPipelineBuilder') -> ExpPipelineBuilder:
+        # TODO ensure that a subsequent (also if nested into another pipeline) does not have a head with the
+        # same name as already given
+
         # Turn ExpStep into ExpPipelinePiece if necessary
         if isinstance(subsequent, ExpStep):
             subsequent = ExpPipelineBuilderPiece(subsequent)
@@ -385,13 +488,11 @@ class Experiment:
         self.timestamps = {}
         self.experiment_suite = experiment_suite
         self.last_root_exp_state = None
+        self.log_export_handler = None
 
     def run(self, root_exp_state: ExpState):
         self.last_root_exp_state = root_exp_state
-
-        print("\n\n== BEGINNING NEW EXPERIMENT " + "=" * 74)
-        print("    NAME: " + self.experiment_name)
-        print(self.experiment_pipeline.get_order_str("    "))
+        self.experiment_suite.log_level_counter.new_experiment()
 
         run_state_dict = {
             "total": 0,
@@ -400,6 +501,7 @@ class Experiment:
             "error": 0,
         }
 
+        # TODO replace all by os.join
         if self.experiment_suite.output_directory is not None:
             exp_out_path = self.experiment_suite.output_directory + "/" + path_safe(self.experiment_name)
             root_exp_state._run_shared_data_dir = exp_out_path + "/shared/data"
@@ -420,24 +522,48 @@ class Experiment:
             if not os.path.exists(root_exp_state.get_run_specific_data_dir()):
                 os.makedirs(root_exp_state.get_run_specific_data_dir())
 
+            log_export_location = os.path.join(exp_out_path, "log.txt")
+            self.log_export_handler = _set_log_export_location(log_export_location)
+
+        logger.log(EXPYPELINE_LOG_LEVEL, "\n\n\u2550\u2500 BEGINNING NEW EXPERIMENT \u2500" + "\u2550" * (_get_terminal_width() - 29))
+        logger.log(EXPYPELINE_LOG_LEVEL, "    NAME: " + self.experiment_name)
+        logger.log(EXPYPELINE_LOG_LEVEL, self.experiment_pipeline.get_order_str("    "))
+
         root_exp_state._experiment_suite = self.experiment_suite
 
         self.timestamps["begin"] = datetime.now()
         self.experiment_pipeline.run(root_exp_state, [self.experiment_name], run_state_dict, pruned=False)
         self.timestamps["end"] = datetime.now()
 
-        print("\n-- ENDING & SAVING EXPERIMENT " + "-" * 72)
+        logger.log(EXPYPELINE_LOG_LEVEL, "\n── ENDING & SAVING EXPERIMENT " + "─" * (_get_terminal_width() - 29))
         state_str = self.get_exp_state_str()
         if self.experiment_suite.output_directory is not None and os.path.isdir(self.experiment_suite.output_directory):
             with open(exp_out_path + "/experiment_state.json", "w") as text_file:
                 text_file.write(state_str)
 
         else:
-            print("! No valid output path specified in ExpSuite ! Not writing experiment state but dumping here: ")
-            print(state_str)
+            logger.warning("! No valid output path specified in ExpSuite ! Not writing experiment state but dumping here: ")
+            logger.log(EXPYPELINE_LOG_LEVEL, state_str)
 
-        run_state_str = f"({run_state_dict['success']}/{run_state_dict['total']} steps successful)"
-        print(f"== ENDED EXPERIMENT === {run_state_str} " + "=" * (78 - len(run_state_str)))
+        logger.log(EXPYPELINE_LOG_LEVEL, "\n\u2554\u2500 SUMMARY \u2500"
+                   + "\u2550" * (_get_terminal_width() - 12) + "\u2557")
+
+        exp_summary = [
+            f"Experiment         {self.experiment_name}",
+            f"Total steps        {run_state_dict['total']}",
+            f"Successful steps   {run_state_dict['success']}",
+            f"Crashed steps      {run_state_dict['error']}",
+            f"Pruned steps       {run_state_dict['pruned']}",
+            f"Warnings           {self.experiment_suite.log_level_counter.last_experiment_log_level_counts['WARNING']}",
+            f"Errors             {self.experiment_suite.log_level_counter.last_experiment_log_level_counts['ERROR']}",
+            f"Fatals             {self.experiment_suite.log_level_counter.last_experiment_log_level_counts['FATAL']}",
+        ]
+
+        for summary in exp_summary:
+            logger.log(EXPYPELINE_LOG_LEVEL, f"\u2551  {summary}"
+                       + (_get_terminal_width() - len(summary) - 3) * " " + "\u2551")
+        logger.log(EXPYPELINE_LOG_LEVEL, "\u255A\u2500 ENDED EXPERIMENT \u2500"
+                   + "\u2550" * (_get_terminal_width() - 21) + "\u255D")
 
     def get_exp_state_str(self) -> str:
         exp_dict = {
@@ -458,9 +584,136 @@ class Experiment:
                 'python_version': sys.version,
             },
             "_expy_version_" : version,
-            "steps": self.experiment_pipeline.to_json_dict(),
+            "_steps_": self.experiment_pipeline.to_json_dict(),
         }
-        return json.dumps(exp_dict, indent=4, sort_keys=True, default=lambda o: str(o))
+
+        def safe_default_serializer(obj):
+            try:
+                return str(obj)
+            except TypeError:
+                return "UnserializableObject"
+
+        return json.dumps(exp_dict, indent=4, sort_keys=True, default=safe_default_serializer)
 
 
+class Summarizer:
+    '''
+    The goal of this class is to provide an interface for the final experiment state output (JSON)
+    in a more readable format which the user might find more convenient to query.
+    Why do we not save experiment states in this format by default?
+        - We only save ExpState differences between ExpSteps. A user, however, will likely want to query
+        a value as accessible at a certain ExpStep, independently of whether it was set in a previous step
+   '''
+    def __init__(self, parent_summarizer: 'Summarizer'):
+        self.sub_dict = None
+        self.parent_summarizer = None
 
+class ParentLookupWrapper:
+    def __init__(self, wrapped_dict: dict, parent_lookup_wrapper: 'ParentLookupWrapper'):
+        self.wrapped_dict = wrapped_dict
+        self.parent_lookup_wrapper = parent_lookup_wrapper
+
+    def __getitem__(self, item):
+        if item in self.wrapped_dict:
+            return self.wrapped_dict[item]
+        elif self.parent_lookup_wrapper is not None:
+            return self.parent_lookup_wrapper[item]
+        else:
+            return None
+
+    def __contains__(self, item):
+        if item in self.wrapped_dict:
+            return True
+        elif self.parent_lookup_wrapper is not None:
+            return item in self.parent_lookup_wrapper
+        return False
+
+# class GlobalSummarizer:
+#     def __init__(self):
+#
+
+
+class ExperimentSummarizer(Summarizer):
+    def __init__(self, exp_dict: dict, parent_summarizer: Summarizer):
+        super(ExperimentSummarizer, self).__init__(parent_summarizer)
+        self.state = {}
+        self.exp_dict = exp_dict
+        self.steps: dict = {}
+        for step in exp_dict["_steps_"]:
+            self.steps[step["_name_"]] = ExpStepSummarizer(step, self)
+
+    def __getitem__(self, item):
+        res = None
+
+        if item in self.steps:
+            res = self.steps[item]
+        if item in self.state:
+            if res is not None:
+                raise KeyError(f"Ambiguous item retrieval! The key {item} describes multiple values. Please "
+                               f"specify the data retrieval by retrieving from 'steps', 'meta', or 'state'.")
+            res = self.meta[item]
+        if item in self.exp_dict:
+            if res is not None:
+                raise KeyError(f"Ambiguous item retrieval! The key {item} describes multiple values. Please "
+                               f"specify the data retrieval by retrieving from 'steps', 'meta', or 'state'.")
+            res = self.state[item]
+
+        return res
+
+
+class ExpStepSummarizer(Summarizer):
+    def __init__(self, step_dict: dict, parent_summarizer: Summarizer):
+        super(ExpStepSummarizer, self).__init__(parent_summarizer)
+        self.state = ParentLookupWrapper(step_dict["_state_"], parent_summarizer.state)
+        self.meta = step_dict["_meta_"]
+        self.subsequents: dict = {}
+        for subsequent in step_dict["_subsequent_"]:
+            self.subsequents[subsequent["_name_"]] = ExpStepSummarizer(subsequent, self)
+
+    def __getitem__(self, item):
+        res = None
+
+        if item in self.subsequents:
+            res = self.subsequents[item]
+        if item in self.meta:
+            if res is not None:
+                raise KeyError(f"Ambiguous item retrieval! The key {item} describes multiple values. Please "
+                      f"specify the data retrieval by retrieving from 'subsequents', 'meta', or 'state'.")
+            res = self.meta[item]
+        if item in self.state:
+            if res is not None:
+                raise KeyError(f"Ambiguous item retrieval! The key {item} describes multiple values. Please "
+                      f"specify the data retrieval by retrieving from 'subsequents', 'meta', or 'state'.")
+            res = self.state[item]
+
+        return res
+
+
+class LogLevelCounter(logging.Handler):
+    log_level_counts = None
+
+    def __init__(self, *args, **kwargs):
+        super(LogLevelCounter, self).__init__(*args, **kwargs)
+        self.last_experiment_log_level_counts = None
+        self.log_level_counts = {
+            "WARNING": 0,
+            "ERROR": 0,
+            "FATAL": 0,
+        }
+
+    def new_experiment(self):
+        self.last_experiment_log_level_counts = {
+            "WARNING": 0,
+            "ERROR": 0,
+            "FATAL": 0,
+        }
+
+    def emit(self, record):
+        l = record.levelname
+        if l not in self.log_level_counts:
+            self.log_level_counts[l] = 0
+        self.log_level_counts[l] += 1
+        if self.last_experiment_log_level_counts:
+            if l not in self.last_experiment_log_level_counts:
+                self.last_experiment_log_level_counts[l] = 0
+            self.last_experiment_log_level_counts[l] += 1

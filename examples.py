@@ -93,7 +93,7 @@ pipeline = pipeline.then(exp.ExpStep("Finetuning model", finetune_model))
 
 # Finally, we set up the ExpSuite, the "mother" of all experiments. It acts as the main control point.
 # We further pass the directory into which all experiment related files will be written (or read from).
-suite = exp.ExpSuite("/home/frederic/Temporary/expy")
+suite = exp.ExpSuite("/home/frederic/Coding/expy")
 # We now add the experiment and its pipeline to the global queue
 suite.queue_experiment("FashionMNIST Hyperparameter Tuning", pipeline)
 
