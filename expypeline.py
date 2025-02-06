@@ -41,6 +41,8 @@ EXPYPELINE_LOG_LEVEL = 21
 
 version = "0.4.0"
 
+# TODO add Empty pipeline
+
 # TODO replace by os functionality
 def path_safe(path: str):
     path = path.replace("\\", "/")
