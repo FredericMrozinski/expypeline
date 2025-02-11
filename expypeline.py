@@ -39,7 +39,7 @@ from typing import Optional, Callable, List
 logger = logging.getLogger("ExPypeline")
 EXPYPELINE_LOG_LEVEL = 21
 
-version = "0.4.0"
+version = "0.5.0"
 
 # TODO add Empty pipeline
 
@@ -128,7 +128,7 @@ class ExpSuite:
 "                     __/ | |                        \n"
 "                    |___/|_|                  v" + str(version) + "\n\n")
 
-        # Warn if no seed setter is passed TODO: make logger warning
+        # Warn if no seed setter is passed
         if self.reproducibility_handler is None:
             logger.warning("No reproducibility handler has been set. Randomness will not be reproducible!")
 
@@ -137,6 +137,7 @@ class ExpSuite:
             logger.log(EXPYPELINE_LOG_LEVEL, f"   - {experiment.experiment_name}")
 
         log_export_handler = None
+        exp_summaries = []
         for experiment in self.experiments:
             if log_export_handler:
                 _remove_log_export_handler(log_export_handler)
@@ -144,13 +145,29 @@ class ExpSuite:
             root_exp_state = ExpState(None)
             root_exp_state._global_shared_data_dir = self.global_shared_directory
             root_exp_state._debug_mode = debug
-            experiment.run(root_exp_state)
+            summary = experiment.run(root_exp_state)
+            exp_summaries.append(summary)
 
             log_export_handler = experiment.log_export_handler
+
+        run_file_location = self._write_exp_summaries(exp_summaries)
+        return GlobalSummarizer(self.output_directory, run_file_location)
 
     def set_reproducibility_handler(self, reproducibility_handler:
             Optional[Callable[[float], None]]):
         self.reproducibility_handler = reproducibility_handler
+
+    def _write_exp_summaries(self, summaries: List[dict]):
+        runs_dir = os.path.join(self.output_directory, ".runs")
+        if not os.path.isdir(runs_dir):
+            os.makedirs(runs_dir)
+
+        json_formatted = json.dumps(summaries, indent=4)
+        summary_file_name = os.path.join(runs_dir, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".json")
+        with open(summary_file_name, "w") as summary_file:
+            summary_file.write(json_formatted)
+
+        return summary_file_name
 
 class ExpState:
     def __init__(self, prev_state: Optional['ExpState'] = None):
@@ -505,8 +522,8 @@ class Experiment:
 
         # TODO replace all by os.join
         if self.experiment_suite.output_directory is not None:
-            exp_out_path = self.experiment_suite.output_directory + "/" + path_safe(self.experiment_name)
-            root_exp_state._run_shared_data_dir = exp_out_path + "/shared/data"
+            exp_out_path = os.path.join(self.experiment_suite.output_directory, path_safe(self.experiment_name))
+            root_exp_state._run_shared_data_dir = os.path.join(exp_out_path, "shared/data")
             if root_exp_state.is_debug_mode():
                 exp_out_path += "/debug"
                 if os.path.exists(exp_out_path):
@@ -550,22 +567,27 @@ class Experiment:
         logger.log(EXPYPELINE_LOG_LEVEL, "\n\u2554\u2500 SUMMARY \u2500"
                    + "\u2550" * (_get_terminal_width() - 12) + "\u2557")
 
-        exp_summary = [
-            f"Experiment         {self.experiment_name}",
-            f"Total steps        {run_state_dict['total']}",
-            f"Successful steps   {run_state_dict['success']}",
-            f"Crashed steps      {run_state_dict['error']}",
-            f"Pruned steps       {run_state_dict['pruned']}",
-            f"Warnings           {self.experiment_suite.log_level_counter.last_experiment_log_level_counts['WARNING']}",
-            f"Errors             {self.experiment_suite.log_level_counter.last_experiment_log_level_counts['ERROR']}",
-            f"Fatals             {self.experiment_suite.log_level_counter.last_experiment_log_level_counts['FATAL']}",
-        ]
 
-        for summary in exp_summary:
-            logger.log(EXPYPELINE_LOG_LEVEL, f"\u2551  {summary}"
-                       + (_get_terminal_width() - len(summary) - 3) * " " + "\u2551")
+        exp_summary = {
+            "Experiment": self.experiment_name,
+            "Directory": os.path.relpath(exp_out_path, self.experiment_suite.output_directory),
+            "Total steps": run_state_dict["total"],
+            "Successful steps": run_state_dict["success"],
+            "Crashed steps": run_state_dict["error"],
+            "Pruned steps": run_state_dict["pruned"],
+            "Warnings": self.experiment_suite.log_level_counter.last_experiment_log_level_counts['WARNING'],
+            "Errors": self.experiment_suite.log_level_counter.last_experiment_log_level_counts['ERROR'],
+            "Fatals": self.experiment_suite.log_level_counter.last_experiment_log_level_counts['FATAL'],
+        }
+
+        for summary_key, summary_val in exp_summary.items():
+            logger.log(EXPYPELINE_LOG_LEVEL, f"\u2551  {summary_key}"
+                       + (18 - len(summary_key)) * " " + str(summary_val)
+                       + (_get_terminal_width() - len(str(summary_val)) - 21) * " " + "\u2551")
         logger.log(EXPYPELINE_LOG_LEVEL, "\u255A\u2500 ENDED EXPERIMENT \u2500"
                    + "\u2550" * (_get_terminal_width() - 21) + "\u255D")
+
+        return exp_summary
 
     def get_exp_state_str(self) -> str:
         exp_dict = {
@@ -630,10 +652,32 @@ class ParentLookupWrapper:
             return item in self.parent_lookup_wrapper
         return False
 
-# class GlobalSummarizer:
-#     def __init__(self):
-#
 
+class GlobalSummarizer(Summarizer):
+    def __init__(self, top_level_expy_path: str, run_file_location: str):
+        self.top_level_expy_path = top_level_expy_path
+        self.run_file_location = run_file_location
+        self.exp_summaries = {}
+        self.summaries_loaded = False
+
+    def _load_summaries(self):
+        with open(os.path.join(self.top_level_expy_path, self.run_file_location)) as f:
+            summaries = json.load(f)
+
+        for summary in summaries:
+            exp_name = summary["Experiment"]
+            exp_location = os.path.join(summary["Directory"], "experiment_state.json")
+            exp_dict = None
+            with open(os.path.join(self.top_level_expy_path, exp_location)) as f:
+                exp_dict = json.load(f)
+            self.exp_summaries[exp_name] = ExperimentSummarizer(exp_dict, None)
+
+    def __getitem__(self, item):
+        if not self.summaries_loaded:
+            self._load_summaries()
+            self.summaries_loaded = True
+
+        return self.exp_summaries[item]
 
 class ExperimentSummarizer(Summarizer):
     def __init__(self, exp_dict: dict, parent_summarizer: Summarizer):
