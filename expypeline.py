@@ -39,7 +39,7 @@ from typing import Optional, Callable, List
 logger = logging.getLogger("ExPypeline")
 EXPYPELINE_LOG_LEVEL = 21
 
-version = "0.5.0"
+version = "0.5.1"
 
 # TODO add Empty pipeline
 
@@ -467,6 +467,21 @@ class ExpPipelineBuilderPiece(ExpPipelineBuilder):
                 runnable.subsequents.append(built_subsequent)
 
         return runnable
+
+
+class Empty(ExpPipelineBuilder):
+    def then(self, subsequent: 'ExpPipelineBuilder'):
+        res = ExpPipelineBuilderPiece(subsequent)
+        return res
+
+    def branch(self, subsequent: 'ExpPipelineBuilder'):
+        return self.then(subsequent)
+
+    def build(self) -> ExpPipelineRunnable:
+        raise RuntimeError("An Empty ExPypeline module cannot stand alone! Call then(..) or branch(..) on it, instead.")
+
+    def _build_rec(self) -> ExpPipelineRunnable:
+        raise RuntimeError("An Empty ExPypeline module cannot stand alone! Call then(..) or branch(..) on it, instead.")
 
 
 class ExpStep(ExpPipelineBuilder):
